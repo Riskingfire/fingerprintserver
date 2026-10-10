@@ -9,12 +9,15 @@ services:
     envVars:
       - key: API_KEY
         generateValue: true
-      - key: DATABASE_URL
-        fromDatabase:
-          name: play-fingerprint-db
-          property: connectionString
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: Riskingfire/fingerprints
+      - key: GITHUB_BRANCH
+        value: main
+      - key: GITHUB_FINGERPRINT_DIR
+        value: fingerprints
+      - key: GITHUB_BANLIST_PATH
+        value: banlist.json
       - key: PYTHON_VERSION
         value: 3.12.8
-databases:
-  - name: play-fingerprint-db
-    plan: free
