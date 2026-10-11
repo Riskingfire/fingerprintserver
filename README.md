@@ -1,5 +1,7 @@
 # Play Fingerprint server — GitHub commit storage
 
+[Source Code](https://github.com/Riskingfire/fingerprinter)
+
 This version replaces PostgreSQL/SQLite with GitHub repository commits. Fingerprints are stored as gzip files under `fingerprints/`; the shared ban list is stored in `banlist.json`. Each fingerprint upload creates a Git commit through GitHub's Contents API. The desktop client can keep using the same Render URL and `API_KEY` because the HTTP API routes are preserved.
 
 ## 1. Configure GitHub access
