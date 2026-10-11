@@ -4,7 +4,9 @@ os.environ.update(GITHUB_TOKEN="x", API_KEY="legacy-secret-key-12345",
     API_KEY1="reader-key-aaaaaaaaaaaa", API_KEY1_PERM="38",
     API_KEY2="uploader-key-bbbbbbbbbbb", API_KEY2_PERM="upload_fingerprints,view_status,read_fingerprints",
     API_KEY2_NAME="desktop uploader",
-    API_KEY3="keymgr-key-cccccccccccccc", API_KEY3_PERM=str(4 + 8 + 256))
+    API_KEY3="keymgr-key-cccccccccccccc", API_KEY3_PERM=str(4 + 8 + 256),
+    API_KEY4="old-env-key-dddddddddddd", API_KEY4_PERM="4", API_KEY4_EXPIRES="2020-01-01",
+    API_KEY5="future-env-key-eeeeeeeeee", API_KEY5_PERM="4", API_KEY5_EXPIRES="2099-12-31")
 sys.path.insert(0, ".")
 import server
 
@@ -110,7 +112,7 @@ assert sec not in stored and "hash" in stored, "secret must not be stored in pla
 chk("new key works", c.get("/api/fingerprints", headers=H(sec)), 200)
 chk("new key limited", c.get("/api/banlist", headers=H(sec)), 403)
 ls = chk("list keys", c.get("/api/keys", headers=H(LEG)), 200).json
-assert all("key" not in k and "hash" not in k for k in ls) and len(ls) == 5, ls
+assert all("key" not in k and "hash" not in k for k in ls) and len(ls) == 7, ls
 admin_key = chk("admin creates admin key", c.post("/api/keys", json={"name": "boss", "permissions": 1}, headers=H(LEG)), 201).json
 chk("mgr cannot revoke stronger key", c.delete(f"/api/keys/{admin_key['id']}", headers=H(KM)), 403)
 chk("edit key", c.patch(f"/api/keys/{kid}", json={"permissions": 4 + 32}, headers=H(LEG)), 200)
@@ -123,6 +125,78 @@ chk("revoke 404", c.delete(f"/api/keys/{kid}", headers=H(LEG)), 404)
 # survives "restart": cache cleared, key still validates from the stored hash
 server._keys_cache.update(data=None, loaded=0.0)
 chk("admin runtime key after cache reset", c.get("/api/keys", headers=H(admin_key["key"])), 200)
+
+# ---- expiry ----
+from datetime import datetime, timezone, timedelta
+now = datetime.now(timezone.utc)
+iso = lambda s: datetime.fromisoformat(s)
+chk("expired env key rejected", c.get("/api/fingerprints", headers=H("old-env-key-dddddddddddd")), 401)
+assert "expired" in c.get("/api/fingerprints", headers=H("old-env-key-dddddddddddd")).json["error"]
+chk("future env key ok", c.get("/api/fingerprints", headers=H("future-env-key-eeeeeeeeee")), 200)
+assert c.get("/api/me", headers=H("future-env-key-eeeeeeeeee")).json["expires"].startswith("2099-12-31T23:59:59")
+assert c.get("/api/me", headers=H(LEG)).json["expires"] is None   # legacy key never expires
+
+# default: ~60 days when nothing is said
+d = chk("create default expiry", c.post("/api/keys", json={"name": "dflt", "permissions": 4}, headers=H(LEG)), 201).json
+days = (iso(d["expires"]) - now).total_seconds() / 86400
+assert 59.9 < days < 60.1 and 59 < d["days_left"] <= 60 and d["expired"] is False, d
+assert FILES["apikeys.json"] and json.loads(FILES["apikeys.json"])["keys"][d["id"]]["expires"] == d["expires"]
+
+# explicit forms
+d30 = chk("expires_in_days", c.post("/api/keys", json={"name": "t30", "permissions": 4, "expires_in_days": 30}, headers=H(LEG)), 201).json
+assert 29.9 < (iso(d30["expires"]) - now).total_seconds() / 86400 < 30.1
+dd = chk("expires_at date", c.post("/api/keys", json={"name": "dt", "permissions": 4, "expires_at": "2099-06-30"}, headers=H(LEG)), 201).json
+assert dd["expires"].startswith("2099-06-30T23:59:59")
+dn = chk("never_expires", c.post("/api/keys", json={"name": "forever", "permissions": 4, "never_expires": True}, headers=H(LEG)), 201).json
+assert dn["expires"] is None and dn["days_left"] is None
+chk("never_expires false = default", c.post("/api/keys", json={"name": "nf", "permissions": 4, "never_expires": False}, headers=H(LEG)), 201)
+
+# bad input
+for bad in ({"expires_in_days": 0}, {"expires_in_days": -5}, {"expires_in_days": "30"}, {"expires_in_days": True},
+            {"expires_in_days": 99999}, {"expires_at": "2020-01-01"}, {"expires_at": "soon"}, {"expires_at": "never"},
+            {"never_expires": "yes"}, {"expires_in_days": 5, "never_expires": True}, {"expires_in_days": 5, "expires_at": "2099-01-01"}):
+    chk(f"reject {bad}", c.post("/api/keys", json={"name": "bad", "permissions": 4, **bad}, headers=H(LEG)), 400)
+before = len(json.loads(FILES["apikeys.json"])["keys"])
+
+# an old key (stored before expiry existed) has no field and must keep working
+store = json.loads(FILES["apikeys.json"])
+store["keys"]["legacy01"] = {"name": "pre-expiry", "hash": server._digest("pfk_oldkey_without_expiry_field"), "permissions": 4,
+                             "created": "2026-01-01T00:00:00+00:00", "created_by": "env:API_KEY"}
+FILES["apikeys.json"] = json.dumps(store).encode(); server._keys_cache.update(data=None, loaded=0.0)
+chk("pre-expiry key still works", c.get("/api/fingerprints", headers=H("pfk_oldkey_without_expiry_field")), 200)
+assert c.get("/api/me", headers=H("pfk_oldkey_without_expiry_field")).json["expires"] is None
+
+# a runtime key actually stops working once its time passes, and can be renewed
+exp = chk("short key", c.post("/api/keys", json={"name": "short", "permissions": 4 + 256, "expires_in_days": 1}, headers=H(LEG)), 201).json
+chk("works before expiry", c.get("/api/fingerprints", headers=H(exp["key"])), 200)
+store = json.loads(FILES["apikeys.json"]); store["keys"][exp["id"]]["expires"] = (now - timedelta(minutes=1)).isoformat()
+FILES["apikeys.json"] = json.dumps(store).encode(); server._keys_cache.update(data=None, loaded=0.0)
+r = chk("rejected after expiry", c.get("/api/fingerprints", headers=H(exp["key"])), 401)
+assert "expired" in r.json["error"]
+row = [k for k in c.get("/api/keys", headers=H(LEG)).json if k["id"] == exp["id"]][0]
+assert row["expired"] is True and row["days_left"] is None
+rn = chk("renew expired key", c.patch(f"/api/keys/{exp['id']}", json={"expires_in_days": 10}, headers=H(LEG)), 200).json
+assert rn["expired"] is False
+chk("renewed key works again", c.get("/api/fingerprints", headers=H(exp["key"])), 200)
+chk("make never-expiring via PATCH", c.patch(f"/api/keys/{exp['id']}", json={"never_expires": True}, headers=H(LEG)), 200)
+assert c.get("/api/me", headers=H(exp["key"])).json["expires"] is None
+
+# a key can't create/extend a key that outlives itself
+tm = chk("expiring key manager", c.post("/api/keys", json={"name": "mgr", "permissions": 4 + 256, "expires_in_days": 5}, headers=H(LEG)), 201).json
+chk("child within parent lifetime ok", c.post("/api/keys", json={"name": "c1", "permissions": 4, "expires_in_days": 3}, headers=H(tm["key"])), 201)
+chk("child default (60d) outlives 5d parent", c.post("/api/keys", json={"name": "c2", "permissions": 4}, headers=H(tm["key"])), 403)
+chk("child never-expires refused", c.post("/api/keys", json={"name": "c3", "permissions": 4, "never_expires": True}, headers=H(tm["key"])), 403)
+chk("cannot extend itself", c.patch(f"/api/keys/{tm['id']}", json={"expires_in_days": 30}, headers=H(tm["key"])), 403)
+
+# a rejected edit changes nothing (not even in memory)
+tgt = chk("edit target", c.post("/api/keys", json={"name": "target", "permissions": 4}, headers=H(LEG)), 201).json
+chk("edit w/ bad expiry rejected", c.patch(f"/api/keys/{tgt['id']}", json={"permissions": 4 + 32, "name": "changed", "expires_in_days": -1}, headers=H(LEG)), 400)
+chk("target still can't read bans", c.get("/api/banlist", headers=H(tgt["key"])), 403)
+assert [k for k in c.get("/api/keys", headers=H(LEG)).json if k["id"] == tgt["id"]][0]["name"] == "target"
+chk("edit w/ nothing", c.patch(f"/api/keys/{tgt['id']}", json={"foo": 1}, headers=H(LEG)), 400)
+
+# permissions endpoint advertises the default; env var config
+assert c.get("/api/permissions", headers=H(LEG)).json["default_key_lifetime_days"] == 60
 
 # ---- perm parsing ----
 P = server.parse_perms

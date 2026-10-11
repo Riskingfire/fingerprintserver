@@ -19,6 +19,8 @@ services:
         value: fingerprints
       - key: GITHUB_BANLIST_PATH
         value: banlist.json
+      - key: KEY_DEFAULT_DAYS
+        value: "60"
       - key: GITHUB_KEYS_PATH
         value: apikeys.json
       # Optional restricted keys (see README section 4). Example:
@@ -26,5 +28,7 @@ services:
       #   generateValue: true
       # - key: API_KEY1_PERM
       #   value: "14"
+      # - key: API_KEY1_EXPIRES
+      #   value: "2027-03-01"   # optional; env keys never expire if this is omitted
       - key: PYTHON_VERSION
         value: 3.12.8

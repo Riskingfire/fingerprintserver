@@ -39,7 +39,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from flask import Flask, request, jsonify, abort, g
 
@@ -62,6 +63,25 @@ KEY_PREFIX = "pfk_"          # runtime-created keys always start with this
 KEYS_CACHE_SECONDS = 30      # how long the runtime key list is cached in memory
 MAX_RUNTIME_KEYS = 100
 BULK_DELETE_LIMIT = 25
+MAX_KEY_DAYS = 3650
+
+
+def _default_key_days():
+    """KEY_DEFAULT_DAYS: lifetime of API-created keys when the request doesn't say (60 = about 2 months).
+    Set to "never" or 0 to make keys non-expiring by default."""
+    raw = os.environ.get("KEY_DEFAULT_DAYS", "60").strip().lower()
+    if raw in ("never", "0", "none", ""):
+        return None
+    try:
+        days = float(raw)
+    except ValueError:
+        raise RuntimeError('KEY_DEFAULT_DAYS must be a number of days or "never"')
+    if not 0 < days <= MAX_KEY_DAYS:
+        raise RuntimeError(f"KEY_DEFAULT_DAYS must be between 0 and {MAX_KEY_DAYS}")
+    return days
+
+
+DEFAULT_KEY_DAYS = _default_key_days()
 
 # --------------------------------------------------------------------------
 # Permissions. Each value is a power of two so they can be summed freely.
@@ -141,6 +161,10 @@ class Principal:
     name: str
     perms: int
     source: str  # "env" or "runtime"
+    expires: Optional[datetime] = None  # None = never expires
+
+    def expired(self):
+        return self.expires is not None and datetime.now(timezone.utc) >= self.expires
 
     def can(self, *flags):
         if self.perms & ADMIN:
@@ -155,6 +179,29 @@ def _digest(secret):
 def _label(value, fallback):
     value = "".join(ch for ch in str(value or "") if ch.isalnum() or ch in "-_. ").strip()[:60]
     return value or fallback
+
+
+def parse_expiry(value):
+    """'2027-01-31' (valid through the end of that day, UTC) or an ISO time -> aware UTC datetime.
+    'never' / empty -> None. Raises ValueError for anything else."""
+    text = str(value or "").strip()
+    if text.lower() in ("", "never", "none"):
+        return None
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return datetime.strptime(text, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("expiry must look like 2027-01-31 or 2027-01-31T12:00:00Z, or be 'never'")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def default_expiry():
+    if DEFAULT_KEY_DAYS is None:
+        return None
+    return datetime.now(timezone.utc) + timedelta(days=DEFAULT_KEY_DAYS)
 
 
 def load_env_keys():
@@ -179,7 +226,11 @@ def load_env_keys():
             perms = READ_ONLY_DEFAULT
             logging.warning("%s_PERM is not set; %s defaults to read-only (%d).", var, var, perms)
         name = _label(os.environ.get(var + "_NAME"), var)
-        found.append((_digest(secret), Principal(f"env:{var}", name, perms, "env")))
+        try:
+            expires = parse_expiry(os.environ.get(var + "_EXPIRES"))
+        except ValueError as exc:
+            raise RuntimeError(f"{var}_EXPIRES is invalid: {exc}")
+        found.append((_digest(secret), Principal(f"env:{var}", name, perms, "env", expires)))
         if len(secret) < 16:
             logging.warning("%s is shorter than 16 characters; use a long random value.", var)
     legacy = os.environ.get("API_KEY", "").strip()
@@ -416,7 +467,13 @@ def runtime_principal(key_id, record):
         perms = parse_perms(record.get("permissions", 0))
     except ValueError:
         perms = 0
-    return Principal(f"key:{key_id}", _label(record.get("name"), key_id), perms, "runtime")
+    expires = None
+    if record.get("expires"):  # a missing/null field means the key predates expiry and never expires
+        try:
+            expires = parse_expiry(record["expires"])
+        except ValueError:
+            expires = datetime.fromtimestamp(0, timezone.utc)  # unreadable value: treat as expired
+    return Principal(f"key:{key_id}", _label(record.get("name"), key_id), perms, "runtime", expires)
 
 
 def authenticate(token):
@@ -442,6 +499,8 @@ def authorized(*needed):
     principal = authenticate(header[7:].strip()) if header.startswith("Bearer ") else None
     if principal is None:
         abort(401, description="Invalid or missing API key")
+    if principal.expired():
+        abort(401, description="This API key has expired")
     if needed and not principal.can(*needed):
         missing = [name for name, bit in PERM.items() if bit in needed and not principal.perms & bit]
         abort(403, description="This API key lacks the required permission: " + ", ".join(missing))
@@ -471,6 +530,11 @@ def key_public(principal, record=None):
     public_id = principal.id[4:] if principal.source == "runtime" else principal.id
     out = {"id": public_id, "name": principal.name, "source": principal.source,
            "permissions": principal.perms, "permission_names": perm_names(principal.perms)}
+    out["expires"] = principal.expires.isoformat() if principal.expires else None
+    out["expired"] = principal.expired()
+    out["days_left"] = None
+    if principal.expires and not out["expired"]:
+        out["days_left"] = round((principal.expires - datetime.now(timezone.utc)).total_seconds() / 86400, 1)
     if record:
         out["created"] = record.get("created")
         out["created_by"] = record.get("created_by")
@@ -499,7 +563,7 @@ def whoami():
 def list_permissions():
     """Lists every permission and its number (any valid key)."""
     authorized()
-    return jsonify(admin_value=ADMIN, max_value=ALL_BITS,
+    return jsonify(admin_value=ADMIN, max_value=ALL_BITS, default_key_lifetime_days=DEFAULT_KEY_DAYS,
                    permissions=[{"name": n, "value": v, "description": d} for n, (v, d) in PERMISSIONS.items()],
                    note="Add the numbers together. Example: READ_FINGERPRINTS (4) + UPLOAD_FINGERPRINTS (8) = 12. "
                         "ADMIN (1) grants everything.")
@@ -771,6 +835,44 @@ def _perms_from_body(value):
         abort(400, description=str(exc))
 
 
+def _expiry_from_body(body):
+    """Reads expires_in_days / expires_at / never_expires. Returns (was_given, datetime_or_None)."""
+    given = [k for k in ("expires_in_days", "expires_at", "never_expires")
+             if k in body and not (k == "never_expires" and body[k] in (False, None))]
+    if not given:
+        return False, None
+    if len(given) > 1:
+        abort(400, description="Use only one of expires_in_days, expires_at, never_expires")
+    field = given[0]
+    value = body[field]
+    if field == "never_expires":
+        if value is not True:
+            abort(400, description='"never_expires" must be true or false')
+        return True, None
+    if field == "expires_in_days":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= MAX_KEY_DAYS:
+            abort(400, description=f'"expires_in_days" must be a number between 0 and {MAX_KEY_DAYS}')
+        return True, datetime.now(timezone.utc) + timedelta(days=value)
+    try:
+        when = parse_expiry(value)
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    if when is None:
+        abort(400, description='Use "never_expires": true for a key that does not expire')
+    if when <= datetime.now(timezone.utc):
+        abort(400, description='"expires_at" must be in the future')
+    return True, when
+
+
+def check_expiry_grantable(principal, expires):
+    """A key can't create or extend a key that outlives itself."""
+    if principal.expires is None:
+        return
+    if expires is None or expires > principal.expires:
+        abort(403, description="A key can't make a key that outlives itself (this key expires "
+                               + principal.expires.isoformat() + ")")
+
+
 @app.get("/api/keys")
 def list_keys():
     """Lists keys (never secrets). Environment keys are read-only here."""
@@ -783,7 +885,9 @@ def list_keys():
 
 @app.post("/api/keys")
 def create_key():
-    """Body: {"name": "label", "permissions": 14}. The secret is shown ONCE in the response."""
+    """Body: {"name": "label", "permissions": 14, optional expiry}. Expiry is one of expires_in_days,
+    expires_at or never_expires; with none of them the key expires after KEY_DEFAULT_DAYS (60).
+    The secret is shown ONCE in the response."""
     me = authorized(P_KEYS)
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
@@ -793,6 +897,10 @@ def create_key():
         abort(400, description='"name" is required')
     perms = _perms_from_body(body.get("permissions"))
     check_grantable(me, perms)
+    given, expires = _expiry_from_body(body)
+    if not given:
+        expires = default_expiry()
+    check_expiry_grantable(me, expires)
     secret = KEY_PREFIX + secrets.token_urlsafe(32)
     with _keys_lock:
         data = load_runtime_keys(force=True)
@@ -802,7 +910,8 @@ def create_key():
         while key_id in data["keys"]:
             key_id = secrets.token_hex(4)
         record = {"name": name, "hash": _digest(secret), "permissions": perms,
-                  "created": utc_now(), "created_by": me.id}
+                  "created": utc_now(), "created_by": me.id,
+                  "expires": expires.isoformat() if expires else None}
         data["keys"][key_id] = record
         try:
             save_runtime_keys(data, f"Create API key {key_id} ({name}){by()}")
@@ -830,24 +939,35 @@ def _runtime_key_or_404(key_id):
 
 @app.patch("/api/keys/<key_id>")
 def edit_key(key_id):
-    """Body: {"name": "...", "permissions": 12}. Either field is optional."""
+    """Body: any of name, permissions, and one of expires_in_days / expires_at / never_expires."""
     me = authorized(P_KEYS)
     body = request.get_json(silent=True)
-    if not isinstance(body, dict) or not ({"name", "permissions"} & set(body)):
-        abort(400, description='Expected JSON with "name" and/or "permissions"')
+    fields = {"name", "permissions", "expires_in_days", "expires_at", "never_expires"}
+    if not isinstance(body, dict) or not (fields & set(body)):
+        abort(400, description='Expected JSON with "name", "permissions" and/or an expiry field '
+                               '(expires_in_days, expires_at or never_expires)')
+    # Validate everything before touching anything, so a rejected request changes nothing.
+    new_name = None
+    if "name" in body:
+        new_name = _label(body["name"], "")
+        if not new_name:
+            abort(400, description='"name" cannot be empty')
+    new_perms = _perms_from_body(body["permissions"]) if "permissions" in body else None
+    expiry_given, new_expires = _expiry_from_body(body)
     with _keys_lock:
-        record = _runtime_key_or_404(key_id)
+        record = dict(_runtime_key_or_404(key_id))  # a copy: the cached original stays untouched until saved
         key_id = _bare_id(key_id)
         check_grantable(me, runtime_principal(key_id, record).perms)  # can't touch keys stronger than yours
-        if "name" in body:
-            name = _label(body["name"], "")
-            if not name:
-                abort(400, description='"name" cannot be empty')
-            record["name"] = name
-        if "permissions" in body:
-            perms = _perms_from_body(body["permissions"])
-            check_grantable(me, perms)
-            record["permissions"] = perms
+        if new_perms is not None:
+            check_grantable(me, new_perms)
+        if expiry_given:
+            check_expiry_grantable(me, new_expires)
+        if new_name is not None:
+            record["name"] = new_name
+        if new_perms is not None:
+            record["permissions"] = new_perms
+        if expiry_given:
+            record["expires"] = new_expires.isoformat() if new_expires else None
         data = load_runtime_keys()
         data["keys"][key_id] = record
         try:

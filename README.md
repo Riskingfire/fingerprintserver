@@ -1,7 +1,6 @@
 # Play Fingerprint server — GitHub commit storage
----
 [Fingerprinter Releases](https://github.com/Riskingfire/fingerprinter/releases)
----
+
 This version replaces PostgreSQL/SQLite with GitHub repository commits. Fingerprints are stored as gzip files under `fingerprints/`; the shared ban list is stored in `banlist.json`. Each fingerprint upload creates a Git commit through GitHub's Contents API. The desktop client can keep using the same Render URL and `API_KEY` because the HTTP API routes are preserved.
 
 ## 1. Configure GitHub access
@@ -83,11 +82,24 @@ curl -X POST https://YOUR-APP.onrender.com/api/keys \
 
 The response contains the new secret (starts with `pfk_`) **once**. Only a SHA-256 hash is stored, in `apikeys.json` in the repository. Manage them with:
 
-- `GET /api/keys` list keys (never shows secrets)
-- `PATCH /api/keys/<id>` change `name` and/or `permissions`
+- `GET /api/keys` list keys (never shows secrets; includes expiry)
+- `PATCH /api/keys/<id>` change `name`, `permissions` and/or expiry (this is how you renew a key)
 - `DELETE /api/keys/<id>` revoke
 
 Keys defined in environment variables show up in the list but can only be changed in Render. Keys with `MANAGE_KEYS` but not `ADMIN` can only hand out permissions they hold themselves, and can't edit or revoke keys stronger than their own.
+
+### Key expiry
+
+- **API-created keys expire after 60 days (about 2 months) by default.** Override per key when you create it, using one of:
+  - `"expires_in_days": 30`
+  - `"expires_at": "2027-01-31"` (valid through the end of that day, UTC; a full ISO time like `2027-01-31T12:00:00Z` also works)
+  - `"never_expires": true`
+- Change the default for everyone with the `KEY_DEFAULT_DAYS` env var in Render (a number of days, or `never`).
+- An expired key gets `401 "This API key has expired"`. It stays in the list (marked `expired`) so you can **renew** it instead of making a new one: `PATCH /api/keys/<id>` with `{"expires_in_days": 60}`. The secret doesn't change. Revoke it with `DELETE` if you don't want it any more.
+- A key can't create or extend a key that outlives itself, and can't renew itself, so an expiring `MANAGE_KEYS` key can't be used to mint permanent ones. Renew from a key that doesn't expire (such as an env or admin key).
+- **`API_KEY` (legacy) never expires**, so existing desktop apps keep working. Env keys (`API_KEY1`, ...) don't expire either unless you add `API_KEY1_EXPIRES=2027-03-01` (a date, an ISO time, or `never`).
+- Keys created before this update have no expiry stored and keep working indefinitely; you can add one with `PATCH`.
+- `GET /api/me` and `GET /api/keys` show `expires`, `expired` and `days_left`.
 
 ## 5. API reference
 
@@ -111,7 +123,7 @@ All routes except `/health` need `Authorization: Bearer <key>`. Missing/invalid 
 | `PUT /api/banlist/<name>` | `MANAGE_BANS` | |
 | `DELETE /api/banlist/<name>` | `MANAGE_BANS` | |
 | `POST /api/analysis` | `RUN_ANALYSIS` | |
-| `GET/POST /api/keys`, `PATCH/DELETE /api/keys/<id>` | `MANAGE_KEYS` | **new** |
+| `GET/POST /api/keys`, `PATCH/DELETE /api/keys/<id>` | `MANAGE_KEYS` | **new**; create/patch accept `expires_in_days`, `expires_at` or `never_expires` |
 
 Every write is attributed in the commit message (`[by <key name>]`) and in the server log, so Git history doubles as an audit trail.
 
