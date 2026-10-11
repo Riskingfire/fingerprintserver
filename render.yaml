@@ -19,5 +19,12 @@ services:
         value: fingerprints
       - key: GITHUB_BANLIST_PATH
         value: banlist.json
+      - key: GITHUB_KEYS_PATH
+        value: apikeys.json
+      # Optional restricted keys (see README section 4). Example:
+      # - key: API_KEY1
+      #   generateValue: true
+      # - key: API_KEY1_PERM
+      #   value: "14"
       - key: PYTHON_VERSION
         value: 3.12.8
